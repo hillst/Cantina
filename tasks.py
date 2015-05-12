@@ -1,10 +1,28 @@
-#!/usr/bin/env python
+#!/home/pi/hillst/.local/bin/inv
 from invoke import task, run
+import os
+"""
+We are allowed to make a set of assumptions, much like make, and treat them as global variables
+
+Assumptions 
+1) Files in wgs_reads have the same name prefix as the blast databases
+2) Sorted files have the same basename and end in .sorted.fastq, they don't have a special directory right now
+"""
+TARGETS="targets.fa"
+BLASTN="blastn"
+THREADS="64"
+GET_READS="~/bin/getBlastRawReads.py"
+K="31"
 
 @task(help={"files":"Runs the full pipeline on the passed fastq files. It's important to note that in order to use wildcard dilemeters you MUST surround them with quotes."})
-def all(files="*.fastq"):
+def all():
     run("echo 'hello from build'")
-    blast(files)
+
+@task
+def pipeline():
+    blast_all()
+    extract_reads()
+    assemble_reads()
 
 @task
 def clean(all=False):
@@ -20,6 +38,7 @@ def setup():
     run("mkdir wgs_reads")
     run("mkdir blastdb")
     run("mkdir extracted_reads")  
+    run("mkdir blast_results")
 """
 Reals tasks
 """
@@ -33,16 +52,41 @@ def sort_fastq(files):
     
 
 @task
-def blast_db(files="wgs_reads/database.fastq", blastdb_dir="blastdb"):
+def blast_db(files="wgs_reads/*.fastq", blastdb_dir="blastdb"):
     title="some_parse_command"
-    run("makeblastdb -type nucl -in " + files + " -title " + title)
+    print "do some stuff with the os call to expand the wildcard and makea blast db for all of these"
+    #run("makeblastdb -type nucl -in " + files + " -title " + title)
 
 @task
-def blast(files="*.fastq"):
-    run("echo 'hello from blast'")
-    run("ls " + files)
+def blast_all():
+    print "running blast"
+    databases = set([thing.split(".")[0] for thing in os.listdir("blastdb")])
+    for database in databases:
+        if database != "targets":
+            run(BLASTN + " " + "-num_threads " + THREADS + " -query " + TARGETS + " -db blastdb/" + database + " -outfmt 6 > blast_results/" + database + ".blastn")
 
-"""
+@task
+def extract_reads():
+    print "extracting reads"
+    for result in os.listdir("blast_results"):
+        basename = result.split(".")[0]
+        run("python " + GET_READS + " -b blast_results/"+result + " -r wgs_reads/" + basename +".sorted.fastq" + " -t " + THREADS)
+    run("mv *.fastq extracted_reads")
+
+@task
+def assemble_reads():
+    for fq in os.listdir("extracted_reads"):
+        basename = fq.split(".")[0] + ".velvet"
+        run("velveth "+ basename + " " + str(K) + " -short -fastq extracted_reads/" + fq)
+        run("velvetg "+ basename + "-cov_cutoff 3.0" )
+
+@task
+def get_ordering():
+    for assembly in os.listdir("*.velvet"):
+        pass
+        #blast assembly against the mRNA    
+
+""" 
 task for building databases
 task for sorting files
 task for extracting reads
@@ -63,7 +107,7 @@ for file in *.fastq;
 do
     BASENAME=`basename $file .fastq`
     velveth $BASENAME 51 -short -fastq $file 
-    velvetg $BASENAME -exp_cov auto 
+    velvetg $BASENAME -exp_cov 2 
     #need an exonerate step :(
     #exonerate --model est2genome --query ../hlcat2.fasta --target mergedScaffolds.fasta
 done;
@@ -80,8 +124,10 @@ echo "running exonerate"
 
 
 TODO:
+-It may be interesting to try and do the entire thing in parallel. That is, it may be more efficient to launch n-processes for each gene instead of just letting them all go at once. Or even just using threads. That actually might be best. It's stupidly parallel and is mostly going to be I/O bound anyway. 
+
+
 -Quantify how much we improved the assembly by
--Handle a process failing (probably by running via java or python)
 -Figure out when to stop iterating.
 -Add new reads to the previous set
 
