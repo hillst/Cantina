@@ -3,7 +3,7 @@ import operator
 import sys
 
 CHAR_P_LINE=80
-NUM_N = 3
+NUM_N = 1
 
 def main():
     if len(sys.argv) < 3 or "--help" in sys.argv or "-h" in sys.argv: 
@@ -11,12 +11,12 @@ def main():
         sys.exit()
     contigs = sys.argv[1]
     blast_hits = sys.argv[2]
-    order, rev_comp = orderScaffolds(blast_hits)
+    order, rev_comp, name = orderScaffolds(blast_hits)
     reads = mergeScaffolds(contigs)    
-    printHits(reads, order, rev_comp)
+    printHits(reads, order, rev_comp, name)
 
-def printHits(reads, order, rev_comp):
-    print ">MERGED_ORDERED_SCAFFOLDS"
+def printHits(reads, order, rev_comp, name):
+    print ">" + name
     for hit in order:
         #check for reversal
         if hit in rev_comp:
@@ -58,8 +58,10 @@ def orderScaffolds(blast_hits):
     order = {}
     contigs = {}
     rev_comp = {}
+    name = ""
     for line in fd:
         query, target, identity, length, mismatches, gapopens, startq, stopq, startt, endt,evalue, bitscore = line.strip().split("\t")
+        name = target
         if int(startt) < int(endt):
             order[query] = int(startt)
         else:
@@ -70,7 +72,7 @@ def orderScaffolds(blast_hits):
         else:
             contigs[query].append(line)
     sorted_order = sorted(order.keys(), key=order.__getitem__)
-    return sorted_order, rev_comp
+    return sorted_order, rev_comp, name
 
 def mergeScaffolds(contigs):
     numNs = 200

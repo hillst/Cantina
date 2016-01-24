@@ -6,13 +6,17 @@ We are allowed to make a set of assumptions, much like make, and treat them as g
 
 Assumptions 
 1) Files in wgs_reads have the same name prefix as the blast databases
-2) Sorted files have the same basename and end in .sorted.fastq, they don't have a special directory right now
+2) Indexes produced by FastqIndex have the same prefix as the fastq files. 
+3) No "pipe" ( | ) symbols in fasta header names
 """
 TARGETS="targets.fa"
 BLASTN="blastn"
-THREADS="64"
-GET_READS="~/bin/getBlastRawReads.py"
+THREADS="8"
+num_jobs=8
+MAX_READS="2000" # A smaller number will result in a "worse" assembly but in faster runtime. It may not be necessary to have more than a couple of hundred for this parmaeter
+GET_READS="~/bin/Cantina/bin/getBlastRawReads.py"
 K="31"
+ITERATIONS=3
 
 @task(help={"files":"Runs the full pipeline on the passed fastq files. It's important to note that in order to use wildcard dilemeters you MUST surround them with quotes."})
 def all():
@@ -20,16 +24,24 @@ def all():
 
 @task
 def pipeline():
-    blast_all()
-    extract_reads()
-    assemble_reads()
+    for i in range(ITERATIONS):
+        if i == 0:
+            target = TARGETS
+        clean_up_extracted_reads()
+        blast_all(target)
+        extract_reads()
+        assemble_reads()
+        get_ordering()
+        gap_close()
+        target = gather_scaffolds(str(i))
+        backup_velvet(str(i))
 
 @task
 def clean(all=False):
     if all:
         run("rm -rf blastdb")
         run("rm -rf wgs_reads")
-    run("rm -rf velvet*")
+    run("rm -rf *.velvet")
     run("rm -rf extracted_reads/*.fastq") 
 
 @task
@@ -50,87 +62,102 @@ def sort_fastq(files):
     run("echo 'sort files'")
     run("rm -rf tmp")
     
-
-@task
-def blast_db(files="wgs_reads/*.fastq", blastdb_dir="blastdb"):
-    title="some_parse_command"
-    print "do some stuff with the os call to expand the wildcard and makea blast db for all of these"
-    #run("makeblastdb -type nucl -in " + files + " -title " + title)
-
-@task
-def blast_all():
-    print "running blast"
-    databases = set([thing.split(".")[0] for thing in os.listdir("blastdb")])
+@task(help={"target":"File containing the contigs that we are searching for."})
+def blast_all(target=TARGETS):
+    print "running blast", target
+    from multiprocessing import Pool
+    p = Pool(num_jobs)
+    databases = set([".".join(thing.split(".")[:-1]) for thing in os.listdir("blastdb") if ".nal" in thing])
+    commands = []
     for database in databases:
         if database != "targets":
-            run(BLASTN + " " + "-num_threads " + THREADS + " -query " + TARGETS + " -db blastdb/" + database + " -outfmt 6 > blast_results/" + database + ".blastn")
+            commands.append(BLASTN + " " + "-num_threads " + THREADS + " -query " + target + " -db blastdb/" + database + " -max_target_seqs " + MAX_READS + " -outfmt 6 > blast_results/" + database + ".blastn")
+    p.map(run, commands) 
+
+def blast_command_helper(command):
+    return 
 
 @task
 def extract_reads():
     print "extracting reads"
     for result in os.listdir("blast_results"):
-        basename = result.split(".")[0]
-        run("python " + GET_READS + " -b blast_results/"+result + " -r wgs_reads/" + basename +".sorted.fastq" + " -t " + THREADS)
+        basename = ".".join(result.split(".")[:-1])
+        run("python " + GET_READS + " -b blast_results/"+result + " -r wgs_reads/" + basename +".fastq" + " -t 8")
     run("mv *.fastq extracted_reads")
 
 @task
 def assemble_reads():
     for fq in os.listdir("extracted_reads"):
-        basename = fq.split(".")[0] + ".velvet"
-        run("velveth "+ basename + " " + str(K) + " -short -fastq extracted_reads/" + fq)
-        run("velvetg "+ basename + "-cov_cutoff 3.0" )
+        basename = ".".join(fq.split(".")[:-1]) + ".velvet"
+        try:
+            run("velveth "+ basename + " " + str(K) + " -short -fastq extracted_reads/" + fq)
+            run("velvetg "+ basename + " -exp_cov auto" )
+        except Exception as e:
+            print "WARNING", basename, "FAILED TO ASSEMBLE"
 
 @task
 def get_ordering():
-    for assembly in os.listdir("*.velvet"):
-        pass
+    count = 0
+    print "getting order"
+    to_get = len([ folder for folder in os.listdir(".") if ".velvet" in folder])
+    suspect = []
+    for assembly in [ folder for folder in os.listdir(".") if ".velvet" in folder]:
+        basename = ".".join(assembly.split(".")[:-1])
+        try:
+            dicks = run("blastn -query " + assembly +"/contigs.fa " + "-db mRNA_blast/mRNA " + " -outfmt 6 | grep " + basename + " > " + assembly + "/contigs.blastn")
+            run("python orderContigs.py " + assembly + "/contigs.fa " + assembly + "/contigs.blastn > " + assembly + "/contigs.ordered.fa")
+        except Exception as e:
+            print "WARNING:", basename, "is empty!!! It is being added to the list of suspcious mRNAs."
+            suspect.append(basename)
+        #run("exonerate --model est2genome --query targets.fa --target "+ assembly+"/contigs.ordered.fa > " +assembly +"/exonerate.txt") 
+        count += 1
+        #print float(count)/to_get, "%\r",
+    print ""
         #blast assembly against the mRNA    
 
-""" 
-task for building databases
-task for sorting files
-task for extracting reads
-task for assembling reads
+@task
+def gap_close():
+    print "gap closing"
+    count = 0
+    to_get = len([ folder for folder in os.listdir(".") if ".velvet" in folder])
+    for assembly in [ folder for folder in os.listdir(".") if ".velvet" in folder]:
+        basename = ".".join(assembly.split(".")[:-1])
+        try:
+            generate_gapclose_config(basename)
+            print assembly + "/gapcloser.config"
+            run("~/bin/GapCloser -a " + assembly + "/contigs.ordered.fa -b " + assembly + "/gapcloser.config -o "+ assembly +"/contigs.ordered.filled.fa -l 200 -p 20 -t " + THREADS) 
+        except Exception as e:
+            pass
+        #run("exonerate --model est2genome --query targets.fa --target "+ assembly+"/contigs.ordered.filled.fa > " +assembly +"/exonerate.filled.txt") 
+        count += 1
+        print float(count)/to_get, "%\r",
+    print ""
 
-echo "targeting unaligned raw reads"
-#blastn -db blastdb/250bp_assembled -query notFound.fasta -outfmt 6 -num_threads 8 > 250bp.blastn
-#blastn -db blastdb/143bp_assembled -query notFound.fasta -outfmt 6 -num_threads 8 > 143bp.blastn
-#blastn -db blastdb/173bp_assembled -query notFound.fasta -outfmt 6 -num_threads 8 > 173bp.blastn
-echo "splitting results by contig..."
-
-echo "finding reads..."
-python ~/bin/getBlastRawReads.py -b 250bp.blastn  -r raw_reads/250bp_teamaker.assembled.sorted.fastq
-python ~/bin/getBlastRawReads.py -b 143bp.blastn  -r raw_reads/143bp_teamaker.assembled.sorted.fastq
-python ~/bin/getBlastRawReads.py -b 173bp.blastn  -r raw_reads/173bp_teamaker.assembled.sorted.fastq
-echo "performing assembly..."
-for file in *.fastq;
-do
-    BASENAME=`basename $file .fastq`
-    velveth $BASENAME 51 -short -fastq $file 
-    velvetg $BASENAME -exp_cov 2 
-    #need an exonerate step :(
-    #exonerate --model est2genome --query ../hlcat2.fasta --target mergedScaffolds.fasta
-done;
-#i don't understand this part but maybe i should? exonerate i thought we used for "ORDER" and then scaffolding or some shit
-echo "determining order of contigs"
-#blastn -db Blast/hlcat -query Bitter/contigs.fa
-
-echo "ordering contigs"
-
-echo "closing contig gaps with Ns"
-
-echo "running exonerate"
-
-
-
-TODO:
--It may be interesting to try and do the entire thing in parallel. That is, it may be more efficient to launch n-processes for each gene instead of just letting them all go at once. Or even just using threads. That actually might be best. It's stupidly parallel and is mostly going to be I/O bound anyway. 
-
-
--Quantify how much we improved the assembly by
--Figure out when to stop iterating.
--Add new reads to the previous set
-
-ALSO NOTE:
-    what we are doing is basically overlap graph but with a crazy process that does local assembly to improve the assembly
 """
+Moving them is another option
+"""
+@task
+def clean_up_extracted_reads():
+    run("rm -f extracted_reads/*")
+
+@task
+def gather_scaffolds(step="1"):
+    for assembly in [ folder for folder in os.listdir(".") if ".velvet" in folder]:
+        try:
+            run("cat " + assembly + "/contigs.ordered.filled.fa >> targets_round"+step+".fa")
+        except Exception as e:
+            pass
+    return "targets_round"+step+".fa"
+
+@task
+def backup_velvet(step="1"): 
+    for assembly in [ folder for folder in os.listdir(".") if ".velvet" in folder]:
+        run("cp " + assembly + "/contigs.ordered.filled.fa " + assembly + "/contigs.ordered.filled." + step + ".fa")
+
+def generate_gapclose_config(transcript):
+    with open(transcript + ".velvet/gapcloser.config", 'w') as fd:
+        print >> fd, "[LIB]"
+        print >> fd, "asm_flags=4"
+        print >> fd, "rank=1"
+        print >> fd, "q=extracted_reads/"+transcript+".fastq"
+    
